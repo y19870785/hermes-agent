@@ -92,6 +92,28 @@ def test_policy_drop_is_body_free_before_persistence(loop_agent, policy_manager)
     assert getattr(loop_agent, "_protected_text_turn", None) is None
 
 
+def test_drop_never_reaches_real_session_db_or_next_provider_request(loop_agent, policy_manager, tmp_path):
+    from hermes_state import SessionDB
+    secret = "FORK1B_DROP_SECRET"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        loop_agent._session_db = db
+        policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [lambda **_k: FinalOutputDrop("stale")]
+        loop_agent.client.chat.completions.create.return_value = _response(secret)
+        first = loop_agent.run_conversation("first input", protected_text_turn=True)
+        assert first["output_disposition"] == "dropped"
+        assert secret not in str(db.get_messages(loop_agent.session_id))
+
+        policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [lambda response, **_k: FinalOutputAllow(response)]
+        loop_agent.client.chat.completions.create.return_value = _response("approved")
+        second = loop_agent.run_conversation("second input", protected_text_turn=True)
+        assert second["output_disposition"] == "allowed"
+        assert secret not in str(loop_agent.client.chat.completions.create.call_args.kwargs.get("messages"))
+        assert secret not in str(db.get_messages(loop_agent.session_id))
+    finally:
+        db.close()
+
+
 def test_policy_allow_commits_only_authorized_body(loop_agent, policy_manager):
     result, snapshots = _run(
         loop_agent, policy_manager, "RAW_SECRET", lambda **_k: FinalOutputAllow("APPROVED")
