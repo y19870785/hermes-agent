@@ -55,6 +55,10 @@ from agent.turn_request_assembly import assemble_api_request
 from agent.turn_response_check import check_api_response
 from agent.turn_response_intake import normalize_model_response
 from agent.turn_tool_round import run_tool_round
+from hermes_cli.middleware import (
+    FINAL_OUTPUT_MIDDLEWARE, ProtectedTextTurn, ProtectedTurnViolation,
+    protected_failure_result, protected_mode_compatible, protected_turn,
+)
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches
@@ -1482,6 +1486,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                 return _rc.result
             if _rc.action == "break":
                 return None
+        except ProtectedTurnViolation as exc:
+            return protected_failure_result(agent, s.messages, s.api_call_count, str(exc))
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
@@ -1508,6 +1514,7 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    protected_text_turn: bool = False,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1576,6 +1583,12 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    if protected_text_turn:
+        from hermes_cli.plugins import has_middleware
+        if (not has_middleware(FINAL_OUTPUT_MIDDLEWARE)
+                or not protected_mode_compatible(agent)):
+            return protected_failure_result(agent, s.messages, s.api_call_count, "protected_mode_unavailable")
+        agent._protected_text_turn = ProtectedTextTurn(agent.session_id or "", s.turn_id)
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
@@ -1626,6 +1639,10 @@ def _run_conversation_turn(
                 return _ri.result
             if _ri.action == "continue":
                 continue
+            if protected_turn(agent) and s.assistant_message.tool_calls:
+                return protected_failure_result(
+                    agent, s.messages, s.api_call_count, "unexpected_tool_calls"
+                )
             _v = _run_phase(
                 run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
             )
@@ -1665,6 +1682,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    protected_text_turn: bool = False,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1679,21 +1697,25 @@ def run_conversation(
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
-        result = _run_conversation_turn(
-            agent,
-            user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            task_id=task_id,
-            stream_callback=stream_callback,
-            persist_user_message=persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            persist_user_display_kind=persist_user_display_kind,
-            persist_user_display_metadata=persist_user_display_metadata,
-            persist_user_platform_id=persist_user_platform_id,
-            moa_config=moa_config,
-            turn_author=turn_author,
-        )
+        try:
+            result = _run_conversation_turn(
+                agent,
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                task_id=task_id,
+                stream_callback=stream_callback,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                moa_config=moa_config,
+                turn_author=turn_author,
+                protected_text_turn=protected_text_turn,
+            )
+        finally:
+            agent._protected_text_turn = None
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result
@@ -1718,6 +1740,8 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
     """
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
+            return
+        if result.get("output_disposition") in {"dropped", "failed_protected_mode"}:
             return
         if (
             result.get("compression_exhausted") or result.get("compression_deferred")

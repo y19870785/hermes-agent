@@ -175,6 +175,9 @@ class StreamDeliveryMixin:
 
     def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
         """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
+        from hermes_cli.middleware import protected_turn
+        if protected_turn(self) is not None:
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
@@ -187,6 +190,9 @@ class StreamDeliveryMixin:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
+        from hermes_cli.middleware import protected_turn
+        if protected_turn(self) is not None:
+            return
         if getattr(self, "interim_assistant_callback", None) is None or not isinstance(text, str):
             return
         visible = self._visible_commentary(text)
@@ -198,6 +204,9 @@ class StreamDeliveryMixin:
         """Surface a real mid-turn assistant commentary message to the UI layer. Does NOT set
         ``_response_was_previewed`` ("the final response was shown") — the CLI would then suppress a
         different final summary."""
+        from hermes_cli.middleware import protected_turn
+        if protected_turn(self) is not None:
+            return
         if not isinstance(assistant_msg, dict):
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
@@ -297,6 +306,9 @@ class StreamDeliveryMixin:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        from hermes_cli.middleware import ProtectedTextTurn
+        if isinstance(getattr(self, "_protected_text_turn", None), ProtectedTextTurn):
+            return
         # A superseded stream must not interleave its tokens alongside the retry that replaced it.
         if self._stream_writer_superseded():
             # See #65991.
@@ -338,6 +350,9 @@ class StreamDeliveryMixin:
 
         ``inline`` marks text recovered from ``<think>`` blocks in content; any other call is a native
         provider reasoning delta and stops inline forwarding for the rest of this model response."""
+        from hermes_cli.middleware import ProtectedTextTurn
+        if isinstance(getattr(self, "_protected_text_turn", None), ProtectedTextTurn):
+            return
         if not inline:
             self._native_reasoning_streamed = True
         if self._stream_writer_superseded():

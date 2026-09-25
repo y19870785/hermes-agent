@@ -19,6 +19,9 @@ from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
 from agent.message_metadata import append_message
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
+from hermes_cli.middleware import (
+    ProtectedTextTurn, ProtectedTurnViolation, protected_request_has_tools, protected_turn,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -49,7 +52,7 @@ def _should_stream(agent: Any) -> bool:
     checks); disabled on provider signal, ACP providers (``acp://`` scheme or an
     external-process provider profile), MoA without a display consumer, or Mock clients in
     tests (SimpleNamespace, not stream iterators)."""
-    if getattr(agent, "_disable_streaming", False):
+    if protected_turn(agent) is not None or getattr(agent, "_disable_streaming", False):
         return False
     _base = str(agent.base_url or "").lower()
     from hermes_cli.runtime_provider_backends import _is_external_process_provider
@@ -87,6 +90,9 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        if isinstance(getattr(agent, "_protected_text_turn", None), ProtectedTextTurn):
+            if protected_turn(agent) is None or protected_request_has_tools(next_api_kwargs):
+                raise ProtectedTurnViolation("protected_provider_request_invalid")
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),

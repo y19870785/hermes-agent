@@ -9,11 +9,13 @@ the ``pre_api_request`` hook and the debug dump. Nothing here imports
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 import logging
 from typing import Any
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
 from utils import env_var_enabled
+from hermes_cli.middleware import protected_request_has_tools, protected_turn, ProtectedTurnViolation
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -104,6 +106,32 @@ def build_api_request(
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None
+    protected = protected_turn(agent)
+    if protected is not None:
+        tools_for_api = []
+        # A failed-turn boundary may stay durable for transcript alternation,
+        # but its Core-authored notice is not an authorized assistant reply.
+        # Display metadata was stripped while building the wire copy, so use
+        # the marked canonical rows to remove their text from this request.
+        failed_notices = {
+            row.get("content") for row in messages
+            if isinstance(row, dict) and row.get("role") == "assistant"
+            and row.get("display_kind") == "failed_turn" and isinstance(row.get("content"), str)
+        }
+        if failed_notices:
+            api_messages = [row for row in api_messages if not (
+                isinstance(row, dict) and row.get("role") == "assistant"
+                and row.get("content") in failed_notices
+            )]
+            api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+        if protected.fragments:
+            # Continuation context is request-local: unapproved fragments never enter
+            # the canonical transcript or a SessionDB checkpoint.
+            api_messages = deepcopy(api_messages)
+            api_messages.extend((
+                {"role": "assistant", "content": "".join(protected.fragments)},
+                {"role": "user", "content": "Continue the unfinished answer."},
+            ))
     # api_messages was built for the primary; a fallback (DeepSeek / Kimi / MiMo) may
     # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
     # the prompt-cache decoration for the current provider.
@@ -114,9 +142,11 @@ def build_api_request(
             tools_for_api=tools_for_api,
         )
     )
+    if protected is not None:
+        tools_for_api = []
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
-    if tools_for_api == agent.tools:
+    if protected is None and tools_for_api == agent.tools:
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:
         api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
@@ -152,6 +182,9 @@ def build_api_request(
     except Exception:
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
+
+    if protected is not None and protected_request_has_tools(api_kwargs):
+        raise ProtectedTurnViolation("protected_request_contains_tools")
 
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,

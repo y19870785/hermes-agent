@@ -17,6 +17,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
     CODEX_FALLBACK_ACTIVATED, continue_codex_incomplete, normalize_response_for_agent, partial_result,
 )
+from hermes_cli.middleware import ProtectedTextTurn, protected_failure_result, protected_turn
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -135,23 +136,35 @@ def normalize_model_response(
     if assistant_message.content is not None and not isinstance(assistant_message.content, str):
         assistant_message.content = _coerce_content_text(assistant_message.content)
 
+    protected = protected_turn(agent)
+    if isinstance(getattr(agent, "_protected_text_turn", None), ProtectedTextTurn) and protected is None:
+        return _verdict("return", protected_failure_result(
+            agent, messages, api_call_count, "protected_turn_stale"
+        ))
+    if protected is not None and getattr(assistant_message, "tool_calls", None):
+        return _verdict("return", protected_failure_result(
+            agent, messages, api_call_count, "unexpected_tool_calls"
+        ))
+
     # Agent-as-provider projection: splice the provider-agent's own tool work in as
     # call/result rows before this turn's assistant message; no-op for ordinary providers.
-    splice_provider_projection(agent, response, messages)
+    if protected is None:
+        splice_provider_projection(agent, response, messages)
 
-    _fire_post_api_request_hook(
-        agent, response, assistant_message, finish_reason, api_messages=api_messages,
-        api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
-        api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
-    )
+    if protected is None:
+        _fire_post_api_request_hook(
+            agent, response, assistant_message, finish_reason, api_messages=api_messages,
+            api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
+            api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
+        )
 
     content = assistant_message.content
-    if content and not agent.quiet_mode:
+    if protected is None and content and not agent.quiet_mode:
         if agent.verbose_logging:
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content}")
         else:
             agent._vprint(f"{agent.log_prefix}🤖 Assistant: {content[:100]}{'...' if len(content) > 100 else ''}")
-    if content and agent.tool_progress_callback:
+    if protected is None and content and agent.tool_progress_callback:
         _relay_thinking(agent, content)
 
     # Incomplete <REASONING_SCRATCHPAD> (opened, never closed): the model ran out of
@@ -165,6 +178,10 @@ def normalize_model_response(
         agent._flush_status_buffer()
         agent._vprint(f"{agent.log_prefix}❌ Max retries (2) for incomplete scratchpad. Saving as partial.", force=True, diagnostic=True)
         agent._incomplete_scratchpad_retries = 0
+        if protected is not None:
+            return _verdict("return", protected_failure_result(
+                agent, messages, api_call_count, "incomplete_scratchpad"
+            ))
         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
