@@ -265,6 +265,25 @@ def test_failure_surfaces_emit_only_core_status(loop_agent):
     assert result["final_response"] is None
 
 
+def test_cli_tui_consumer_renders_only_core_failure_status(loop_agent):
+    from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
+    result = protected_failure_result(loop_agent, [{"role": "user", "content": "input"}], 1, "final_output_dropped")
+    shown = []
+    host = SimpleNamespace(
+        agent=loop_agent, provider="test", model="test", _voice_continuous=False, _voice_tts=False,
+        _chat_resolve_interrupt=lambda *_a: (None, False),
+        _chat_print_reasoning_box=lambda *_a: None,
+        _chat_print_response_panel=lambda _turn, response: shown.append(response),
+        _emit_focus_recovery_line=lambda: None, _ring_bell=lambda **_k: None,
+    )
+    turn = SimpleNamespace(result=result, use_streaming_tts=False)
+    rendered = CLIChatTurnMixin._chat_render_turn(host, turn, None, None)
+    assert rendered == shown[0]
+    assert rendered
+    assert "FORK1B_DROP_SECRET" not in rendered
+    assert "FORK1B_DROP_SECRET" not in str(result)
+
+
 def test_missing_final_policy_refuses_before_provider(loop_agent, policy_manager):
     policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = []
     loop_agent.client.chat.completions.create.return_value = _response("FORK1B_DROP_SECRET")
