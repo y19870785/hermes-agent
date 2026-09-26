@@ -53,6 +53,46 @@ Supported middleware kinds:
 | `tool_request` | `tool_name`, `args`, `original_args` | `{"args": {...}}` | Replace effective tool args before hooks, guardrails, approvals, and execution. |
 | `llm_execution` | `request`, `original_request`, `next_call` | Any provider response | Wrap or replace the actual provider call. |
 | `tool_execution` | `tool_name`, `args`, `original_args`, `next_call` | Any tool result | Wrap or replace the actual tool call. |
+| `final_output` | `response`, `session_id`, `turn_id`, `platform`, `model`, `provider` | `FinalOutputAllow(text)` or `FinalOutputDrop(reason_code)` | Authorize the final body of an explicitly protected text turn before its first assistant commit. |
+
+### Temporary compatibility capability: protected text turns
+
+This pinned compatibility build adds an opt-in text-only turn through the trusted
+local `AIAgent.run_conversation(..., protected_text_turn=True)` entrypoint. It
+is not enabled by prompt text or model output. A protected turn requires at
+least one `final_output` middleware registration; otherwise it fails before a
+provider call. The caller can detect the build with
+`hermes_cli.middleware.supports_protected_text_turn()` and
+`supports_final_output_gate()`.
+
+```python
+from hermes_cli.middleware import FinalOutputAllow, FinalOutputDrop
+
+def authorize_final_output(*, response, session_id, turn_id, **_context):
+    if current_policy_allows(session_id, turn_id):
+        return FinalOutputAllow(response)
+    return FinalOutputDrop("stale_turn")
+
+def register(ctx):
+    ctx.register_middleware("final_output", authorize_final_output)
+```
+
+The callback receives the final turn-authoritative candidate after the legacy
+`transform_llm_output` hook. It must return one of the two typed decisions.
+`None`, empty strings, booleans and exceptions are **not** DROP signals; they
+are policy errors and fail closed. Policies run in registration order. Each
+ALLOW response becomes the next policy's input; the first DROP stops the
+chain. A decision is reused for the same candidate digest within one live
+turn. Policy callbacks are synchronous and should remain bounded.
+
+Protected turns make tools unavailable and choose Hermes' non-streaming
+provider execution path for every attempt. Model-derived interim text is not
+delivered before final authorization. DROP leaves no rejected model body in
+the assistant transcript, next-turn history, or final response. Hermes may
+still present a separate Core-generated failure status. Normal turns retain
+their existing tool, streaming, middleware, and transform behavior. This
+compatibility capability does not reverse tool side effects or add a database
+migration; protected text turns prohibit tools mechanically.
 
 Request middleware can return optional trace fields:
 

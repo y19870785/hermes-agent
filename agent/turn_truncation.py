@@ -229,6 +229,15 @@ class _Trunc(TruncationVerdict):
         the ``(failure_reason, retryable)`` verdict for the UI descriptor.
         """
         agent = self.agent
+        from hermes_cli.middleware import protected_failure_result, protected_turn
+        if protected_turn(agent) is not None:
+            if cleanup:
+                agent._cleanup_task_resources(self.effective_task_id)
+            # No continuation fragment was added to canonical messages in protected mode.
+            agent._persist_session(self.messages, self.conversation_history)
+            return self.done("return", protected_failure_result(
+                agent, self.messages, self.api_call_count, "protected_output_incomplete"
+            ))
         if cleanup:
             agent._cleanup_task_resources(self.effective_task_id)
         agent._persist_session(self.messages, self.conversation_history)
@@ -492,6 +501,21 @@ def recover_from_truncation(
     _trunc_msg = normalize_response_for_agent(agent, response)
     _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
     _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
+
+    from hermes_cli.middleware import protected_failure_result, protected_turn
+    protected = protected_turn(agent)
+    if protected is not None:
+        if _trunc_has_tool_calls:
+            return st.done("return", protected_failure_result(
+                agent, messages, api_call_count, "unexpected_tool_calls"
+            ))
+        st.length_continue_retries += 1
+        if isinstance(_trunc_content, str) and _trunc_content:
+            protected.fragments.append(_trunc_content)
+        if st.length_continue_retries < 4 and protected.fragments:
+            _retry.restart_with_length_continuation = True
+            return st.done("break")
+        return st.end_turn(None, "protected_output_incomplete", failed=True)
 
     abort = _abort_reason(agent, _trunc_content, _trunc_has_tool_calls)
     if abort is not None:

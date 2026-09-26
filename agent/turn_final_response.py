@@ -64,7 +64,7 @@ def finish_text_response(
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
     iteration-limit summarization; the final message is appended and flushed only after the
-    stop gates accept it."""
+    stop gates accept it. Protected turns defer that append and flush to the finalizer."""
     from agent.conversation_loop import (
         _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
         _join_truncated_parts
@@ -83,6 +83,16 @@ def finish_text_response(
             api_call_count=api_call_count,
             result=result,
         )
+
+    from hermes_cli.middleware import (
+        FinalOutputAllow, protected_failure_result, protected_mode_compatible,
+        protected_turn, run_final_output_policies,
+    )
+    protected = protected_turn(agent)
+    if protected is not None and finish_reason == "tool_calls":
+        return _verdict("return", protected_failure_result(
+            agent, messages, api_call_count, "unexpected_tool_call_finish"
+        ))
 
     # Reasoning-only clean stop: some reasoning parsers (vLLM nemotron_v3 past ~500K
     # prompt tokens) file the whole answer as reasoning when the model omits the closing
@@ -205,6 +215,10 @@ def finish_text_response(
     else:
         _continuation_kind = None
     if _continuation_kind:
+        if protected is not None:
+            return _verdict("return", protected_failure_result(
+                agent, messages, api_call_count, "interim_continuation_forbidden"
+            ))
         if _continuation_kind == "stall":
             logger.info(
                 "Stall guard: turn ending on trailing continue-"
@@ -319,6 +333,10 @@ def finish_text_response(
     ):
         messages.pop()
 
+    if protected is not None and not protected_mode_compatible(agent):
+        return _verdict("return", protected_failure_result(
+            agent, messages, api_call_count, "stop_gate_became_incompatible"
+        ))
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,
         conversation_history=conversation_history,
@@ -337,6 +355,12 @@ def finish_text_response(
     # there, an interrupted turn keeps the raw text.
     from agent.turn_finalizer import apply_llm_output_transform
     _transformed = False
+    if protected is not None and protected.fragments:
+        final_response = _join_truncated_parts([
+            *((part, False) for part in protected.fragments),
+            (final_response or "", False),
+        ])
+        protected.fragments.clear()
     if not getattr(agent, "_interrupt_requested", False):
         final_response, _transformed, _ = apply_llm_output_transform(
             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
@@ -346,6 +370,26 @@ def finish_text_response(
             final_msg["api_content"] = final_response
         else:
             final_msg["content"] = final_response
+
+    if protected is not None:
+        if getattr(agent, "_interrupt_requested", False):
+            return _verdict("return", protected_failure_result(
+                agent, messages, api_call_count, "protected_interrupted"
+            ))
+        try:
+            decision = run_final_output_policies(agent, final_response)
+        except BaseException:
+            decision = None
+        if not isinstance(decision, FinalOutputAllow):
+            result = protected_failure_result(agent, messages, api_call_count, "final_output_dropped")
+            result["output_disposition"] = "dropped"
+            return _verdict("return", result)
+        final_response = decision.response
+        # A recovery path can still replace this candidate. Keep the authorized body
+        # turn-local until the finalizer identifies the authoritative response; an
+        # append here could be flushed to SessionDB before a later policy DROP.
+        _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+        return _verdict("break")
 
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps

@@ -781,6 +781,11 @@ def settle_delivered_partial(agent: Any, messages: Any, current_turn_user_idx: A
     mid-stream death + continuation + pre-stream error the live accumulator is empty and the
     fragment rows (now collapsed into one assistant row) are the only record.
     """
+    from hermes_cli.middleware import protected_turn
+    if protected_turn(agent) is not None:
+        # Protected continuation text exists only on the request-local state. It
+        # was never delivered, so ordinary partial-response recovery cannot claim it.
+        return ""
     from agent.turn_truncation import collapse_continuation_trail
     collapsed = collapse_continuation_trail(
         agent, messages, current_turn_user_idx, finish_reason="error",

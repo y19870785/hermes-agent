@@ -28,8 +28,11 @@ class TurnFacadeMixin:
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
+        protected_text_turn: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        if type(protected_text_turn) is not bool:
+            raise TypeError("protected_text_turn must be a bool")
         # A review shares this session_id for cache parity: fence review startup or interrupt
         # an admitted request and await its exit before opening live-turn instrumentation.
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
@@ -151,6 +154,7 @@ class TurnFacadeMixin:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
+                        protected_text_turn=protected_text_turn,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;

@@ -7,6 +7,7 @@ wrapping the actual execution callback. Agent-loop call sites and plugins share 
 from __future__ import annotations
 
 import logging
+import hashlib
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
@@ -20,10 +21,145 @@ TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+FINAL_OUTPUT_MIDDLEWARE = "final_output"
 
 VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
+    FINAL_OUTPUT_MIDDLEWARE,
 }
+
+
+@dataclass(frozen=True)
+class FinalOutputAllow:
+    response: str
+
+
+@dataclass(frozen=True)
+class FinalOutputDrop:
+    reason_code: str | None = None
+
+
+@dataclass
+class ProtectedTextTurn:
+    session_id: str
+    turn_id: str
+    decisions: Dict[str, FinalOutputAllow | FinalOutputDrop] = field(default_factory=dict)
+    authorized_body: str | None = None
+    disposition: str | None = None
+    fragments: List[str] = field(default_factory=list)
+
+
+class ProtectedTurnViolation(Exception):
+    """A protected request cannot safely proceed to the provider or transcript."""
+
+
+def supports_protected_text_turn() -> bool:
+    return True
+
+
+def supports_final_output_gate() -> bool:
+    return True
+
+
+def protected_turn(agent: Any) -> ProtectedTextTurn | None:
+    state = getattr(agent, "_protected_text_turn", None)
+    if (isinstance(state, ProtectedTextTurn)
+            and state.session_id == (getattr(agent, "session_id", None) or "")
+            and state.turn_id == (getattr(agent, "_current_turn_id", None) or "")):
+        return state
+    return None
+
+
+def protected_failure_result(agent: Any, messages: Any, api_calls: int, reason: str) -> Dict[str, Any]:
+    """A body-free terminal result. A failure is never an assistant message."""
+    state = protected_turn(agent)
+    if state is not None:
+        state.disposition = "failed_protected_mode"
+        state.fragments.clear()
+    return {
+        "final_response": None, "messages": messages, "api_calls": api_calls,
+        "completed": False, "failed": True, "output_disposition": "failed_protected_mode",
+        "failure_reason": reason, "error": reason,
+    }
+
+
+def protected_request_has_tools(request: Any) -> bool:
+    if not isinstance(request, dict):
+        return True
+    if request.get("tools") or request.get("functions"):
+        return True
+    choice = request.get("tool_choice", request.get("function_call"))
+    return choice not in (None, "none", "None")
+
+
+def protected_mode_compatible(agent: Any) -> bool:
+    """Reject modes that can emit an attempted answer before final authorization."""
+    from agent.verification_stop import verify_on_stop_enabled
+    from agent.kanban_stop import kanban_stop_nudge_enabled
+
+    return (
+        getattr(agent, "api_mode", None) not in {"codex_app_server", "codex_responses"}
+        and not verify_on_stop_enabled()
+        and not kanban_stop_nudge_enabled()
+        and not bool(getattr(agent, "_turn_file_mutation_paths", None))
+    )
+
+
+def run_final_output_policies(agent: Any, candidate: str) -> FinalOutputAllow | FinalOutputDrop:
+    """Authorize the final, transformed body. Unlike execution middleware, failure denies."""
+    from hermes_cli.plugins import _delivery_manager
+
+    state = protected_turn(agent)
+    if state is None:
+        return FinalOutputDrop("protected_turn_stale")
+    if not isinstance(candidate, str):
+        return FinalOutputDrop("invalid_candidate")
+    try:
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    except Exception:
+        logger.error("protected final-output candidate could not be hashed")
+        return FinalOutputDrop("invalid_candidate")
+    cached = state.decisions.get(digest)
+    if cached is not None:
+        return cached
+    try:
+        callbacks = list(_delivery_manager()._middleware.get(FINAL_OUTPUT_MIDDLEWARE, ()))
+    except BaseException:
+        logger.error("protected final-output policy registry unavailable")
+        decision = FinalOutputDrop("policy_registry_error")
+        state.decisions[digest] = decision
+        state.disposition = "dropped"
+        return decision
+    if not callbacks:
+        decision: FinalOutputAllow | FinalOutputDrop = FinalOutputDrop("policy_required")
+    else:
+        body = candidate
+        decision = FinalOutputAllow(body)
+        for callback in callbacks:
+            try:
+                result = callback(**middleware_payload(
+                    response=body, session_id=state.session_id, turn_id=state.turn_id,
+                    platform=getattr(agent, "platform", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                    provider=getattr(agent, "provider", "") or "",
+                ))
+                if isinstance(result, FinalOutputDrop):
+                    decision = result
+                    break
+                if not isinstance(result, FinalOutputAllow) or not isinstance(result.response, str):
+                    decision = FinalOutputDrop("invalid_policy_result")
+                    break
+                body = result.response
+                decision = FinalOutputAllow(body)
+            except BaseException:
+                logger.error("protected final-output policy failed")
+                decision = FinalOutputDrop("policy_error")
+                break
+    state.decisions[digest] = decision
+    state.disposition = "allowed" if isinstance(decision, FinalOutputAllow) else "dropped"
+    if isinstance(decision, FinalOutputAllow):
+        state.authorized_body = decision.response
+    return decision
 
 
 @dataclass

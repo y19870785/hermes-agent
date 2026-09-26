@@ -490,11 +490,15 @@ def apply_llm_output_transform(
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
-    _turn_exit_reason, _pending_verification_response=None,
+    _turn_exit_reason, current_turn_user_idx=None, _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
+    from hermes_cli.middleware import (
+        FinalOutputAllow, protected_turn, run_final_output_policies,
+    )
+    protected = protected_turn(agent)
 
     final_response, _turn_exit_reason, preserved_verification_fallback = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -546,7 +550,7 @@ def finalize_turn(
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, failed, completed
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -556,13 +560,50 @@ def finalize_turn(
         # gets the recorded outcome back. Either way the tail close below writes the text the
         # user will see, never the raw model text (#44239).
         if final_response and not interrupted:
+            if protected is not None and final_response != protected.authorized_body:
+                # The earlier transform belongs to the superseded candidate. A
+                # recovered candidate needs its own transform before authorization.
+                agent._llm_output_transform = None
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
+        if (protected is not None and final_response and not interrupted
+                and final_response != protected.authorized_body):
+            try:
+                decision = run_final_output_policies(agent, final_response)
+            except BaseException:
+                decision = None
+            if isinstance(decision, FinalOutputAllow):
+                final_response = decision.response
+            else:
+                final_response = None
+                failed = True
+                completed = False
+                protected.disposition = "dropped"
+        if protected is not None and protected.disposition == "dropped":
+            # Only this turn's unapproved output may be removed. Earlier turns are untouched.
+            start = current_turn_user_idx
+            if isinstance(start, int) and 0 <= start < len(messages):
+                messages[start + 1:] = [
+                    row for row in messages[start + 1:]
+                    if not (isinstance(row, dict) and row.get("role") == "assistant")
+                ]
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+    if protected is not None and final_response and not failed and not interrupted:
+        # _persist_session may swallow a failed SQLite flush. Only its intrinsic
+        # persisted marker proves the final body was committed before delivery.
+        tail = messages[-1] if messages else None
+        if (not isinstance(tail, dict) or tail.get("role") != "assistant"
+                or tail.get("content") != final_response or not tail.get(_DB_PERSISTED_MARKER)):
+            final_response = None
+            failed = True
+            completed = False
+            protected.disposition = "failed_protected_mode"
+            if isinstance(tail, dict) and tail.get("role") == "assistant" and not tail.get(_DB_PERSISTED_MARKER):
+                messages.pop()
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
@@ -572,9 +613,9 @@ def finalize_turn(
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
+    if final_response and not interrupted and protected is None:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
+    if not interrupted and protected is None:
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
@@ -582,7 +623,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if final_response and not interrupted and protected is None:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -614,7 +655,7 @@ def finalize_turn(
 
     result = {
         "final_response": final_response,
-        "last_reasoning": _last_turn_reasoning(messages),
+        "last_reasoning": None if protected is not None else _last_turn_reasoning(messages),
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
@@ -644,6 +685,10 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if protected is not None:
+        result["output_disposition"] = protected.disposition or (
+            "interrupted" if interrupted else "failed_protected_mode" if failed else "allowed"
+        )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway
