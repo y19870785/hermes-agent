@@ -64,7 +64,7 @@ def finish_text_response(
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
     iteration-limit summarization; the final message is appended and flushed only after the
-    stop gates accept it."""
+    stop gates accept it. Protected turns defer that append and flush to the finalizer."""
     from agent.conversation_loop import (
         _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
         _join_truncated_parts
@@ -385,7 +385,11 @@ def finish_text_response(
             result["output_disposition"] = "dropped"
             return _verdict("return", result)
         final_response = decision.response
-        final_msg = {"role": "assistant", "content": final_response}
+        # A recovery path can still replace this candidate. Keep the authorized body
+        # turn-local until the finalizer identifies the authoritative response; an
+        # append here could be flushed to SessionDB before a later policy DROP.
+        _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+        return _verdict("break")
 
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps

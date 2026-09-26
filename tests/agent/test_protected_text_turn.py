@@ -24,8 +24,9 @@ def policy_manager(monkeypatch):
 
 
 @pytest.fixture()
-def loop_agent(monkeypatch):
+def loop_agent(monkeypatch, tmp_path):
     from run_agent import AIAgent
+    from hermes_state import SessionDB
 
     tool = {"type": "function", "function": {
         "name": "test_tool", "description": "test", "parameters": {"type": "object", "properties": {}}
@@ -46,9 +47,12 @@ def loop_agent(monkeypatch):
     agent.compression_enabled = False
     agent.save_trajectories = False
     agent._has_stream_consumers = lambda: True
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent._session_db = db
     monkeypatch.setattr(agent, "_save_trajectory", lambda *_a, **_k: None)
     monkeypatch.setattr(agent, "_cleanup_task_resources", lambda *_a, **_k: None)
-    return agent
+    yield agent
+    db.close()
 
 
 def _response(text, *, tool_calls=None, finish_reason="stop"):
@@ -63,11 +67,15 @@ def _run(agent, policy_manager, answer, policy, *, provider_response=None):
     policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [policy]
     agent.client.chat.completions.create.return_value = provider_response or _response(answer)
     snapshots = []
+    def persist(rows, *_args):
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        snapshots.append(("persist", [dict(row) for row in rows]))
+        if rows and rows[-1].get("role") == "assistant":
+            rows[-1][_DB_PERSISTED_MARKER] = True
     persistence_spies = (
         patch.object(agent, "_flush_messages_to_session_db", side_effect=lambda rows, *_a: snapshots.append(
             ("flush", [dict(row) for row in rows]))),
-        patch.object(agent, "_persist_session", side_effect=lambda rows, *_a: snapshots.append(
-            ("persist", [dict(row) for row in rows]))),
+        patch.object(agent, "_persist_session", side_effect=persist),
     )
     with persistence_spies[0], persistence_spies[1]:
         result = agent.run_conversation("test input", protected_text_turn=True)
@@ -135,6 +143,137 @@ def test_policy_rewrite_is_not_reauthorized_by_normal_finalizer(loop_agent, poli
     assert result["output_disposition"] == "allowed"
     assert result["final_response"] == "APPROVED"
     assert any(rows[-1].get("content") == "APPROVED" for _, rows in snapshots)
+
+
+def test_protected_recovery_changed_candidate_drop_never_commits_original(loop_agent, policy_manager, monkeypatch):
+    from hermes_state import SessionDB
+
+    db: SessionDB = loop_agent._session_db
+    seen = []
+    def policy(response, **_kwargs):
+        seen.append(response)
+        return FinalOutputAllow(response) if response == "FORK1B_APPROVED_A" else FinalOutputDrop("stale")
+    def recover(_agent, _response, _interrupted, _failed):
+        # The normal path has authorized A, but final recovery has not committed it.
+        assert "FORK1B_APPROVED_A" not in str(db.get_messages(loop_agent.session_id))
+        return "FORK1B_RECOVERED_B", True
+    monkeypatch.setattr("agent.turn_finalizer._recover_final_from_stream", recover)
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [policy]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+
+    result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert seen == ["FORK1B_APPROVED_A", "FORK1B_RECOVERED_B"]
+    assert result["output_disposition"] == "dropped"
+    assert result["final_response"] is None
+    assert "FORK1B_APPROVED_A" not in str(db.get_messages(loop_agent.session_id))
+    assert "FORK1B_RECOVERED_B" not in str(db.get_messages(loop_agent.session_id))
+
+
+def test_protected_recovery_changed_candidate_allow_commits_only_recovered(loop_agent, policy_manager, monkeypatch):
+    db = loop_agent._session_db
+    seen = []
+    def policy(response, **_kwargs):
+        seen.append(response)
+        return FinalOutputAllow(response)
+    def recover(_agent, _response, _interrupted, _failed):
+        assert "FORK1B_APPROVED_A" not in str(db.get_messages(loop_agent.session_id))
+        return "FORK1B_RECOVERED_B", True
+    monkeypatch.setattr("agent.turn_finalizer._recover_final_from_stream", recover)
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [policy]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+
+    result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert seen == ["FORK1B_APPROVED_A", "FORK1B_RECOVERED_B"]
+    assert result["output_disposition"] == "allowed"
+    assert result["final_response"] == "FORK1B_RECOVERED_B"
+    durable = str(db.get_messages(loop_agent.session_id))
+    assert "FORK1B_APPROVED_A" not in durable
+    assert durable.count("FORK1B_RECOVERED_B") == 1
+
+
+def test_protected_recovery_transforms_new_candidate_before_new_policy(loop_agent, policy_manager, monkeypatch):
+    seen = []
+    def transform(name, _logger, **kwargs):
+        return [kwargs["response_text"] + "_TRANSFORMED"] if name == "transform_llm_output" else []
+    monkeypatch.setattr("agent.turn_finalizer._invoke_hook_safely", transform)
+    monkeypatch.setattr("agent.turn_finalizer._recover_final_from_stream", lambda *_a: ("FORK1B_RECOVERED_B", True))
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [
+        lambda response, **_k: (seen.append(response), FinalOutputAllow(response))[1]
+    ]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+
+    result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert seen == ["FORK1B_APPROVED_A_TRANSFORMED", "FORK1B_RECOVERED_B_TRANSFORMED"]
+    assert result["final_response"] == "FORK1B_RECOVERED_B_TRANSFORMED"
+    durable = str(loop_agent._session_db.get_messages(loop_agent.session_id))
+    assert "FORK1B_APPROVED_A" not in durable
+    assert durable.count("FORK1B_RECOVERED_B_TRANSFORMED") == 1
+
+
+def test_protected_unchanged_candidate_evaluates_once_and_commits_once(loop_agent, policy_manager):
+    seen = []
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [
+        lambda response, **_k: (seen.append(response), FinalOutputAllow(response))[1]
+    ]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+
+    result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert result["output_disposition"] == "allowed"
+    assert seen == ["FORK1B_APPROVED_A"]
+    assert str(loop_agent._session_db.get_messages(loop_agent.session_id)).count("FORK1B_APPROVED_A") == 1
+
+
+def test_protected_final_at_iteration_limit_is_completed(loop_agent, policy_manager):
+    loop_agent.max_iterations = 1
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [
+        lambda response, **_k: FinalOutputAllow(response)
+    ]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+
+    result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert result["output_disposition"] == "allowed"
+    assert result["completed"] is True
+    assert result["turn_exit_reason"].startswith("text_response(")
+
+
+def test_protected_persistence_failure_does_not_deliver_body(loop_agent, policy_manager):
+    import sqlite3
+
+    db = loop_agent._session_db
+    append = db.append_messages_batch
+    def fail_assistant(*args, **kwargs):
+        rows = kwargs.get("messages", ())
+        if any(row.get("role") == "assistant" for row in rows):
+            raise sqlite3.OperationalError("injected protected assistant write failure")
+        return append(*args, **kwargs)
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [
+        lambda response, **_k: FinalOutputAllow(response)
+    ]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+    with patch.object(db, "append_messages_batch", side_effect=fail_assistant):
+        result = loop_agent.run_conversation("test input", protected_text_turn=True)
+
+    assert result["output_disposition"] == "failed_protected_mode"
+    assert result["final_response"] is None
+    assert "FORK1B_APPROVED_A" not in str(db.get_messages(loop_agent.session_id))
+    assert "FORK1B_APPROVED_A" not in str(result["messages"])
+
+
+def test_protected_failure_before_finalizer_commit_has_no_assistant_body(loop_agent, policy_manager):
+    policy_manager._middleware[FINAL_OUTPUT_MIDDLEWARE] = [
+        lambda response, **_k: FinalOutputAllow(response)
+    ]
+    loop_agent.client.chat.completions.create.return_value = _response("FORK1B_APPROVED_A")
+    with patch.object(loop_agent, "_persist_session", side_effect=RuntimeError("pre-commit failure")):
+        result = loop_agent.run_conversation("test input", protected_text_turn=True)
+    assert result["output_disposition"] == "failed_protected_mode"
+    assert result["final_response"] is None
+    assert "FORK1B_APPROVED_A" not in str(loop_agent._session_db.get_messages(loop_agent.session_id))
 
 
 @pytest.mark.parametrize("policy", [lambda **_k: None, lambda **_k: "", lambda **_k: (_ for _ in ()).throw(RuntimeError("deny"))])

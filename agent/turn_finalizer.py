@@ -560,6 +560,10 @@ def finalize_turn(
         # gets the recorded outcome back. Either way the tail close below writes the text the
         # user will see, never the raw model text (#44239).
         if final_response and not interrupted:
+            if protected is not None and final_response != protected.authorized_body:
+                # The earlier transform belongs to the superseded candidate. A
+                # recovered candidate needs its own transform before authorization.
+                agent._llm_output_transform = None
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         if (protected is not None and final_response and not interrupted
                 and final_response != protected.authorized_body):
@@ -588,6 +592,18 @@ def finalize_turn(
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+    if protected is not None and final_response and not failed and not interrupted:
+        # _persist_session may swallow a failed SQLite flush. Only its intrinsic
+        # persisted marker proves the final body was committed before delivery.
+        tail = messages[-1] if messages else None
+        if (not isinstance(tail, dict) or tail.get("role") != "assistant"
+                or tail.get("content") != final_response or not tail.get(_DB_PERSISTED_MARKER)):
+            final_response = None
+            failed = True
+            completed = False
+            protected.disposition = "failed_protected_mode"
+            if isinstance(tail, dict) and tail.get("role") == "assistant" and not tail.get(_DB_PERSISTED_MARKER):
+                messages.pop()
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
